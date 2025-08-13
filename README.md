@@ -35,6 +35,9 @@ deactivate
 ### 5. Dataset download
 Download the dataset from: https://www.kaggle.com/datasets/mrdheer/cars-dataset
 
+### 6. Run the app
+python3 app.py
+
 ## Notes
 - The virtual environment folder `venv/` is typically added to `.gitignore`
 - Always activate the virtual environment before running Python scripts

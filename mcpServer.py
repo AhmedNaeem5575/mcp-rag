@@ -3,9 +3,11 @@ import faiss
 import numpy as np
 import requests
 import openai
-from mcp.server import Server
-from mcp import Tool
+from mcp.server.fastmcp import FastMCP
 import os
+import json
+import time
+import pickle
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,28 +17,92 @@ API_KEY = os.getenv("OPEN_AI_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv('DISCORD_WEBHOOK_URL')
 SLACK_WEBHOOK_URL = os.getenv('SLACK_WEBHOOK')
 CSV_FILE = "./data/cars.csv"
+EMBEDDINGS_CACHE = "./data/embeddings_cache.pkl"
+TEXTS_CACHE = "./data/texts_cache.pkl"
 # ====================
+
+model_name = "gpt-4.1-mini"
+deployment = "gpt-4.1-mini"
 
 # Memory store
 last_answer = None
 
 # ==== Load CSV ====
 df = pd.read_csv(CSV_FILE)
-texts = []
-for _, row in df.iterrows():
-    row_text = ", ".join([f"{col}: {row[col]}" for col in df.columns])
-    texts.append(row_text)
+
+def load_or_create_embeddings():
+    """Load cached embeddings or create them with rate limiting"""
+    global texts, index, client
+    
+    # Check if cache exists and is newer than CSV
+    cache_exists = os.path.exists(EMBEDDINGS_CACHE) and os.path.exists(TEXTS_CACHE)
+    if cache_exists:
+        csv_mtime = os.path.getmtime(CSV_FILE)
+        cache_mtime = os.path.getmtime(EMBEDDINGS_CACHE)
+        if cache_mtime > csv_mtime:
+            print("📦 Loading cached embeddings...")
+            with open(TEXTS_CACHE, 'rb') as f:
+                texts = pickle.load(f)
+            with open(EMBEDDINGS_CACHE, 'rb') as f:
+                emb_np = pickle.load(f)
+            dimension = len(emb_np[0])
+            index = faiss.IndexFlatL2(dimension)
+            index.add(emb_np)
+            print("✅ Cached embeddings loaded!")
+            return
+    
+    # Create texts from CSV
+    print("🔄 Processing CSV data...")
+    texts = []
+    for _, row in df.iterrows():
+        row_text = ", ".join([f"{col}: {row[col]}" for col in df.columns])
+        texts.append(row_text)
+    
+    # Create embeddings with rate limiting
+    print(f"🚀 Creating embeddings for {len(texts)} rows...")
+    
+    embeddings = []
+    for i, text in enumerate(texts):
+        try:
+            emb = client.embeddings.create(input=text, model="text-embedding-3-small").data[0].embedding
+            embeddings.append(emb)
+            if (i + 1) % 10 == 0:
+                print(f"  Processed {i + 1}/{len(texts)} rows...")
+            # Rate limiting - wait between requests
+            time.sleep(0.1)  # 100ms delay between requests
+        except Exception as e:
+            if "429" in str(e):
+                print(f"  Rate limit hit at row {i + 1}, waiting 2 seconds...")
+                time.sleep(2)
+                # Retry the request
+                emb = client.embeddings.create(input=text, model="text-embedding-3-small").data[0].embedding
+                embeddings.append(emb)
+            else:
+                raise e
+    
+    emb_np = np.array(embeddings).astype('float32')
+    dimension = len(emb_np[0])
+    index = faiss.IndexFlatL2(dimension)
+    index.add(emb_np)
+    
+    # Cache the results
+    print("💾 Caching embeddings...")
+    os.makedirs(os.path.dirname(EMBEDDINGS_CACHE), exist_ok=True)
+    with open(TEXTS_CACHE, 'wb') as f:
+        pickle.dump(texts, f)
+    with open(EMBEDDINGS_CACHE, 'wb') as f:
+        pickle.dump(emb_np, f)
+    print("✅ Embeddings cached!")
 
 # ==== Build FAISS index ====
-client = openai.OpenAI(api_key=API_KEY)
-embeddings = [
-    client.embeddings.create(input=text, model="text-embedding-3-small").data[0].embedding
-    for text in texts
-]
-emb_np = np.array(embeddings).astype('float32')
-dimension = len(emb_np[0])
-index = faiss.IndexFlatL2(dimension)
-index.add(emb_np)
+client = openai.AzureOpenAI(
+    api_version="2024-12-01-preview",
+    azure_endpoint="https://test-ofmp-sellerhub-ssr6495.openai.azure.com/",
+    api_key=API_KEY,
+)
+texts = []
+index = None
+load_or_create_embeddings()
 
 # ==== RAG search ====
 def search_csv(query, top_k=3):
@@ -53,7 +119,7 @@ def get_car_info(query: str):
     prompt = f"Answer the question based only on this car data:\n{context}\n\nQuestion: {query}"
     
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=model_name,
         messages=[
             {"role": "system", "content": "You are a car data assistant."},
             {"role": "user", "content": prompt}
@@ -88,28 +154,22 @@ def send_to_slack(message: str = None):
         return f"❌ Error sending to Slack: {r.text}"
 
 # ==== Register MCP server ====
-server = Server("CarRAGBot")
+mcp = FastMCP("CarRAGBot")
 
-server.add_tool(Tool(
-    name="get_car_info",
-    description="Get car information using CSV RAG",
-    parameters={"query": {"type": "string", "description": "User's car-related question"}},
-    function=get_car_info
-))
+@mcp.tool()
+def get_car_info_tool(query: str) -> str:
+    """Get car information using CSV RAG"""
+    return get_car_info(query)
 
-server.add_tool(Tool(
-    name="send_to_discord",
-    description="Send last answer or a custom message to Discord",
-    parameters={"message": {"type": "string", "description": "Optional custom message"},},
-    function=send_to_discord
-))
+@mcp.tool()
+def send_to_discord_tool(message: str = None) -> str:
+    """Send last answer or a custom message to Discord"""
+    return send_to_discord(message)
 
-server.add_tool(Tool(
-    name="send_to_slack",
-    description="Send last answer or a custom message to Slack",
-    parameters={"message": {"type": "string", "description": "Optional custom message"},},
-    function=send_to_slack
-))
+@mcp.tool()
+def send_to_slack_tool(message: str = None) -> str:
+    """Send last answer or a custom message to Slack"""
+    return send_to_slack(message)
 
 if __name__ == "__main__":
-    server.run()
+    mcp.run()
